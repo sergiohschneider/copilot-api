@@ -133,7 +133,7 @@ function sanitizePayload(
 
   // Fix 2: Rough token budget — trim older messages if payload is too large.
   // Keep system message(s) + last N messages to stay under ~120k chars (~100k tokens).
-  const MAX_CHARS = 240_000 // ~60k tokens — more aggressive trim to avoid retry loops
+  const MAX_CHARS = 120_000 // ~30k tokens — aggressive trim; Copilot returns incomplete on large payloads
   const totalChars = JSON.stringify(cleaned).length
 
   if (totalChars > MAX_CHARS) {
