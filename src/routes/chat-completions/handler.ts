@@ -72,7 +72,9 @@ export async function handleCompletion(c: Context) {
 }
 
 // ── Sanitize payload to prevent common 400 errors ──────────────
-function sanitizePayload(payload: ChatCompletionsPayload): ChatCompletionsPayload {
+function sanitizePayload(
+  payload: ChatCompletionsPayload,
+): ChatCompletionsPayload {
   let messages = [...payload.messages]
 
   // Fix 1: Remove orphaned tool_result messages whose tool_use_id
@@ -91,26 +93,36 @@ function sanitizePayload(payload: ChatCompletionsPayload): ChatCompletionsPayloa
     }
 
     // Filter out tool messages with orphaned IDs
-    if (msg.role === "tool" && msg.tool_call_id) {
-      if (!validToolCallIds.has(msg.tool_call_id)) {
-        consola.warn(`Dropping orphaned tool result: ${msg.tool_call_id}`)
-        continue
-      }
+    if (
+      msg.role === "tool"
+      && msg.tool_call_id
+      && !validToolCallIds.has(msg.tool_call_id)
+    ) {
+      consola.warn(`Dropping orphaned tool result: ${msg.tool_call_id}`)
+      continue
     }
 
     // Also check content arrays for tool_result blocks (Anthropic format)
     if (Array.isArray(msg.content)) {
-      const filteredContent = (msg.content as Array<{ type: string; tool_use_id?: string }>).filter((part) => {
-        if (part.type === "tool_result" && part.tool_use_id) {
-          if (!validToolCallIds.has(part.tool_use_id)) {
-            consola.warn(`Dropping orphaned tool_result block: ${part.tool_use_id}`)
-            return false
-          }
+      const filteredContent = (
+        msg.content as Array<{ type: string; tool_use_id?: string }>
+      ).filter((part) => {
+        if (
+          part.type === "tool_result"
+          && part.tool_use_id
+          && !validToolCallIds.has(part.tool_use_id)
+        ) {
+          consola.warn(
+            `Dropping orphaned tool_result block: ${part.tool_use_id}`,
+          )
+          return false
         }
         return true
       })
       if (filteredContent.length === 0) {
-        consola.warn("Dropping message with no remaining content after tool_result cleanup")
+        consola.warn(
+          "Dropping message with no remaining content after tool_result cleanup",
+        )
         continue
       }
       msg.content = filteredContent
@@ -122,28 +134,112 @@ function sanitizePayload(payload: ChatCompletionsPayload): ChatCompletionsPayloa
   // Fix 2: Rough token budget — trim older messages if payload is too large.
   // Keep system message(s) + last N messages to stay under ~120k chars (~100k tokens).
   const MAX_CHARS = 480_000 // ~120k tokens rough estimate
-  let totalChars = JSON.stringify(cleaned).length
+  const totalChars = JSON.stringify(cleaned).length
 
   if (totalChars > MAX_CHARS) {
-    consola.warn(`Payload too large (${totalChars} chars), trimming older messages`)
+    consola.warn(
+      `Payload too large (${totalChars} chars), trimming older messages`,
+    )
 
     // Separate system messages from the rest
-    const systemMsgs = cleaned.filter(m => m.role === "system" || m.role === "developer")
-    const nonSystem = cleaned.filter(m => m.role !== "system" && m.role !== "developer")
+    const systemMsgs = cleaned.filter(
+      (m) => m.role === "system" || m.role === "developer",
+    )
+    const nonSystem = cleaned.filter(
+      (m) => m.role !== "system" && m.role !== "developer",
+    )
 
     // Keep removing from the front (oldest) until under budget
-    while (nonSystem.length > 2 && JSON.stringify([...systemMsgs, ...nonSystem]).length > MAX_CHARS) {
+    while (
+      nonSystem.length > 2
+      && JSON.stringify([...systemMsgs, ...nonSystem]).length > MAX_CHARS
+    ) {
       const removed = nonSystem.shift()
       consola.debug(`Trimmed message role=${removed?.role}`)
     }
 
     messages = [...systemMsgs, ...nonSystem]
-    consola.info(`Trimmed to ${messages.length} messages (${JSON.stringify(messages).length} chars)`)
+    consola.info(
+      `Trimmed to ${messages.length} messages (${JSON.stringify(messages).length} chars)`,
+    )
+
+    // Re-sanitize after trim: the trim may have removed assistant messages
+    // with tool_calls, leaving orphaned tool results behind.
+    messages = removeOrphanedToolResults(messages)
   } else {
     messages = cleaned
   }
 
   return { ...payload, messages }
+}
+
+/**
+ * Remove tool results whose corresponding tool_use/tool_calls
+ * don't exist in any preceding assistant message.
+ */
+function removeOrphanedToolResults(
+  messages: ChatCompletionsPayload["messages"],
+): ChatCompletionsPayload["messages"] {
+  const knownToolCallIds = new Set<string>()
+  const result: typeof messages = []
+
+  for (const msg of messages) {
+    // Collect tool_call IDs from assistant messages
+    if (msg.role === "assistant" && msg.tool_calls) {
+      for (const tc of msg.tool_calls) {
+        knownToolCallIds.add(tc.id)
+      }
+    }
+
+    // Also collect tool_use IDs from content arrays (Anthropic format)
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      for (const part of msg.content as Array<{ type: string; id?: string }>) {
+        if (part.type === "tool_use" && part.id) {
+          knownToolCallIds.add(part.id)
+        }
+      }
+    }
+
+    // Drop orphaned tool-role messages
+    if (
+      msg.role === "tool"
+      && msg.tool_call_id
+      && !knownToolCallIds.has(msg.tool_call_id)
+    ) {
+      consola.warn(
+        `[post-trim] Dropping orphaned tool result: ${msg.tool_call_id}`,
+      )
+      continue
+    }
+
+    // Drop orphaned tool_result blocks inside content arrays
+    if (Array.isArray(msg.content)) {
+      const filtered = (
+        msg.content as Array<{ type: string; tool_use_id?: string }>
+      ).filter((part) => {
+        if (
+          part.type === "tool_result"
+          && part.tool_use_id
+          && !knownToolCallIds.has(part.tool_use_id)
+        ) {
+          consola.warn(
+            `[post-trim] Dropping orphaned tool_result block: ${part.tool_use_id}`,
+          )
+          return false
+        }
+        return true
+      })
+      if (filtered.length === 0) {
+        consola.warn("[post-trim] Dropping empty message after orphan cleanup")
+        continue
+      }
+      msg.content = filtered
+    }
+
+    result.push(msg)
+  }
+
+  return result
 }
 
 const isNonStreaming = (
