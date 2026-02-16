@@ -170,6 +170,23 @@ function sanitizePayload(
     messages = cleaned
   }
 
+  // Guard: never send empty messages array
+  if (messages.length === 0) {
+    consola.error("Sanitization resulted in 0 messages — injecting fallback")
+    messages = [{ role: "user", content: "Continue." }]
+  }
+
+  // Guard: if only system messages remain, add a user message
+  const hasNonSystem = messages.some(
+    (m) => m.role !== "system" && m.role !== "developer",
+  )
+  if (!hasNonSystem) {
+    consola.warn(
+      "Only system messages remain after trim — injecting fallback user message",
+    )
+    messages.push({ role: "user", content: "Continue." })
+  }
+
   return { ...payload, messages }
 }
 
